@@ -12,6 +12,7 @@ use std::convert::TryInto;
 use std::path::Path;
 
 use super::channel::ChannelSender;
+use super::deferred_notify::DeferredNotifier;
 use super::ll::Request as _;
 use super::reply::ReplyDirectoryPlus;
 use super::reply::{Reply, ReplyDirectory, ReplySender};
@@ -25,6 +26,8 @@ use super::{ll, KernelConfig};
 pub struct Request<'a> {
     /// Channel sender for sending the reply
     ch: ChannelSender,
+    /// Deferred notifier for enqueueing cache invalidations
+    deferred: &'a DeferredNotifier,
     /// Request raw data
     #[allow(unused)]
     data: &'a [u8],
@@ -34,7 +37,11 @@ pub struct Request<'a> {
 
 impl<'a> Request<'a> {
     /// Create a new request from the given data
-    pub(crate) fn new(ch: ChannelSender, data: &'a [u8]) -> Option<Request<'a>> {
+    pub(crate) fn new(
+        ch: ChannelSender,
+        deferred: &'a DeferredNotifier,
+        data: &'a [u8],
+    ) -> Option<Request<'a>> {
         let request = match ll::AnyRequest::try_from(data) {
             Ok(request) => request,
             Err(err) => {
@@ -43,7 +50,16 @@ impl<'a> Request<'a> {
             }
         };
 
-        Some(Self { ch, data, request })
+        Some(Self {
+            ch,
+            deferred,
+            data,
+            request,
+        })
+    }
+
+    pub fn deferred_notifier(&self) -> &DeferredNotifier {
+        self.deferred
     }
 
     /// Dispatch request to the given filesystem.

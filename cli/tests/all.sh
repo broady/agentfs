@@ -22,4 +22,5 @@ DIR="$(dirname "$0")"
 "$DIR/test-mount.sh"
 "$DIR/test-overlay-whiteout.sh"
 "$DIR/test-overlay-delta-in-base-dir.sh"
+"$DIR/test-fuse-cache-invalidation.sh"
 "$DIR/test-symlinks.sh" || true  # Requires user namespaces (may fail in CI)

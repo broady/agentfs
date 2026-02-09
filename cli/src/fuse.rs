@@ -68,7 +68,8 @@ fn maximize_fd_limit() {
     }
 }
 
-/// Cache entries never expire - we explicitly invalidate on mutations.
+/// Cache entries never expire — we use deferred kernel cache invalidation
+/// (via Notifier::inval_entry) after mutations to keep the dcache consistent.
 /// This is safe because we are the only writer to the filesystem.
 const TTL: Duration = Duration::MAX;
 
@@ -602,7 +603,7 @@ impl Filesystem for AgentFSFuse {
     ///
     /// Verifies the target is a directory and is empty before removal.
     /// Returns `ENOTDIR` if not a directory, `ENOTEMPTY` if not empty.
-    fn rmdir(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+    fn rmdir(&mut self, req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
         tracing::debug!("FUSE::rmdir: parent={}, name={:?}", parent, name);
 
         let Some(name_str) = name.to_str() else {
@@ -619,6 +620,7 @@ impl Filesystem for AgentFSFuse {
         match result {
             Ok(()) => {
                 reply.ok();
+                req.deferred_notifier().inval_entry(parent, name);
             }
             Err(e) => reply.error(error_to_errno(&e)),
         }
@@ -772,7 +774,7 @@ impl Filesystem for AgentFSFuse {
     /// Removes a file (unlinks it from the directory).
     ///
     /// Gets the file's inode before removal to clean up the path cache.
-    fn unlink(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+    fn unlink(&mut self, req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
         tracing::debug!("FUSE::unlink: parent={}, name={:?}", parent, name);
 
         let Some(name_str) = name.to_str() else {
@@ -789,6 +791,7 @@ impl Filesystem for AgentFSFuse {
         match result {
             Ok(()) => {
                 reply.ok();
+                req.deferred_notifier().inval_entry(parent, name);
             }
             Err(e) => reply.error(error_to_errno(&e)),
         }
@@ -799,7 +802,7 @@ impl Filesystem for AgentFSFuse {
     /// Moves `name` from `parent` to `newname` under `newparent`.
     fn rename(
         &mut self,
-        _req: &Request,
+        req: &Request,
         parent: u64,
         name: &OsStr,
         newparent: u64,
@@ -841,6 +844,9 @@ impl Filesystem for AgentFSFuse {
         match result {
             Ok(()) => {
                 reply.ok();
+                let dn = req.deferred_notifier();
+                dn.inval_entry(parent, name);
+                dn.inval_entry(newparent, newname);
             }
             Err(e) => reply.error(error_to_errno(&e)),
         }

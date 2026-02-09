@@ -51,6 +51,7 @@ mod channel;
     unexpected_cfgs,
     clippy::manual_is_multiple_of
 )]
+pub(crate) mod deferred_notify;
 mod ll;
 #[allow(clippy::io_other_error)]
 mod mnt;

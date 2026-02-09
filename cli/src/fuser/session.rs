@@ -14,6 +14,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
+use std::sync::mpsc;
+
+use super::deferred_notify::{DeferredNotifier, NotifyOp};
 use super::ll::fuse_abi as abi;
 use super::request::Request;
 use super::Filesystem;
@@ -64,6 +67,10 @@ pub struct Session<FS: Filesystem> {
     pub(crate) initialized: bool,
     /// True if the filesystem was destroyed (destroy operation done)
     pub(crate) destroyed: bool,
+    /// Sender half of the deferred notification queue
+    notify_tx: Option<mpsc::Sender<NotifyOp>>,
+    /// Receiver half — moved to the notify thread in run()
+    notify_rx: Option<mpsc::Receiver<NotifyOp>>,
 }
 
 impl<FS: Filesystem> AsFd for Session<FS> {
@@ -109,6 +116,8 @@ impl<FS: Filesystem> Session<FS> {
             SessionACL::Owner
         };
 
+        let (notify_tx, notify_rx) = mpsc::channel();
+
         Ok(Session {
             filesystem,
             ch,
@@ -119,6 +128,8 @@ impl<FS: Filesystem> Session<FS> {
             proto_minor: 0,
             initialized: false,
             destroyed: false,
+            notify_tx: Some(notify_tx),
+            notify_rx: Some(notify_rx),
         })
     }
 
@@ -126,6 +137,7 @@ impl<FS: Filesystem> Session<FS> {
     /// filesystem anywhere; that must be done separately.
     pub fn from_fd(filesystem: FS, fd: OwnedFd, acl: SessionACL) -> Self {
         let ch = Channel::new(Arc::new(fd.into()));
+        let (notify_tx, notify_rx) = mpsc::channel();
         Session {
             filesystem,
             ch,
@@ -136,6 +148,8 @@ impl<FS: Filesystem> Session<FS> {
             proto_minor: 0,
             initialized: false,
             destroyed: false,
+            notify_tx: Some(notify_tx),
+            notify_rx: Some(notify_rx),
         }
     }
 
@@ -146,20 +160,43 @@ impl<FS: Filesystem> Session<FS> {
     /// # Errors
     /// Returns any final error when the session comes to an end.
     pub fn run(&mut self) -> io::Result<()> {
+        let notify_rx = self.notify_rx.take().expect("run() called more than once");
+        let notifier = self.notifier();
+        let notify_handle = thread::spawn(move || {
+            for op in notify_rx {
+                let res = match op {
+                    NotifyOp::InvalEntry { parent, ref name } => {
+                        notifier.inval_entry(parent, name.as_os_str())
+                    }
+                };
+                if let Err(e) = res {
+                    debug!("FUSE notify failed: {e}");
+                }
+            }
+        });
+
+        // A single DeferredNotifier shared by all requests in this session,
+        // avoiding a Sender clone on every FUSE request dispatch.
+        let deferred =
+            DeferredNotifier::new(self.notify_tx.as_ref().expect("notify_tx missing").clone());
+
         // Buffer for receiving requests from the kernel. Only one is allocated and
         // it is reused immediately after dispatching to conserve memory and allocations.
         let mut buffer = vec![0; BUFFER_SIZE];
         let buf = aligned_sub_buf(&mut buffer, std::mem::align_of::<abi::fuse_in_header>());
+        let mut result = Ok(());
         loop {
             // Read the next request from the given channel to kernel driver
             // The kernel driver makes sure that we get exactly one request per read
             match self.ch.receive(buf) {
-                Ok(size) => match Request::new(self.ch.sender(), &buf[..size]) {
-                    // Dispatch request
-                    Some(req) => req.dispatch(self),
-                    // Quit loop on illegal request
-                    None => break,
-                },
+                Ok(size) => {
+                    match Request::new(self.ch.sender(), &deferred, &buf[..size]) {
+                        // Dispatch request
+                        Some(req) => req.dispatch(self),
+                        // Quit loop on illegal request
+                        None => break,
+                    }
+                }
                 Err(err) => match err.raw_os_error() {
                     Some(
                           ENOENT // Operation interrupted. Accordingly to FUSE, this is safe to retry
@@ -168,11 +205,23 @@ impl<FS: Filesystem> Session<FS> {
                     ) => continue,
                     Some(ENODEV) => break,
                     // Unhandled error
-                    _ => return Err(err),
+                    _ => {
+                        result = Err(err);
+                        break;
+                    }
                 },
             }
         }
-        Ok(())
+
+        // Drop all senders to close the channel, then join the notify thread
+        // to ensure in-flight invalidations are flushed before returning.
+        drop(deferred);
+        self.notify_tx.take();
+        if let Err(e) = notify_handle.join() {
+            warn!("notify thread panicked: {e:?}");
+        }
+
+        result
     }
 
     /// Unmount the filesystem

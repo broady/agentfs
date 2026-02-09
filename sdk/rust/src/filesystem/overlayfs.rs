@@ -617,9 +617,18 @@ impl FileSystem for OverlayFS {
             let ino = self.get_or_create_overlay_ino(Layer::Delta, delta_stats.ino, &path);
             let mut stats = delta_stats;
 
-            // Check for origin mapping to return stable inode
+            // Origin mapping: reuse an existing Base overlay inode for stable
+            // numbering within a session.  After remount the base_ino stored in
+            // the mapping may be stale (the new HostFS has a fresh inode cache),
+            // so only use it when the reverse_map already contains a live entry.
+            // Otherwise keep the Delta overlay inode — the downstream code
+            // already walks base from root when the parent is tagged Delta.
             if let Some(base_ino) = self.get_origin_ino(stats.ino) {
-                stats.ino = self.get_or_create_overlay_ino(Layer::Base, base_ino, &path);
+                let reverse = self.reverse_map.read().unwrap();
+                stats.ino = reverse
+                    .get(&(Layer::Base, base_ino))
+                    .copied()
+                    .unwrap_or(ino);
             } else {
                 stats.ino = ino;
             }
@@ -2145,6 +2154,48 @@ mod tests {
         Ok(())
     }
 
+    /// After remount, origin mappings can leave overlay inodes tagged as
+    /// Layer::Base with stale base inode numbers. Verify that base files
+    /// in directories with origin mappings remain accessible.
+    #[tokio::test]
+    async fn test_overlay_base_file_accessible_after_remount() -> Result<()> {
+        let base_dir = tempdir()?;
+        std::fs::create_dir(base_dir.path().join("dir"))?;
+        std::fs::write(base_dir.path().join("dir/base.txt"), b"base content")?;
+        std::fs::write(base_dir.path().join("dir/keep.txt"), b"keep")?;
+
+        let delta_dir = tempdir()?;
+        let db_path = delta_dir.path().join("delta.db");
+
+        // Session 1: create delta file (creates origin mapping for /dir/)
+        {
+            let base = Arc::new(HostFS::new(base_dir.path())?);
+            let delta = AgentFS::new(db_path.to_str().unwrap()).await?;
+            let overlay = OverlayFS::new(base, delta);
+            overlay.init(base_dir.path().to_str().unwrap()).await?;
+
+            let dir_stats = overlay.lookup(ROOT_INO, "dir").await?.unwrap();
+            let (_s, f) = overlay
+                .create_file(dir_stats.ino, "delta.txt", DEFAULT_FILE_MODE, 0, 0)
+                .await?;
+            f.pwrite(0, b"delta").await?;
+        }
+
+        // Session 2: remount and verify base files are still accessible
+        {
+            let base = Arc::new(HostFS::new(base_dir.path())?);
+            let delta = AgentFS::new(db_path.to_str().unwrap()).await?;
+            let overlay = OverlayFS::new(base, delta);
+            overlay.init(base_dir.path().to_str().unwrap()).await?;
+
+            let dir_stats = overlay.lookup(ROOT_INO, "dir").await?.unwrap();
+            let keep = overlay.lookup(dir_stats.ino, "keep.txt").await?;
+            assert!(keep.is_some(), "keep.txt should be visible after remount");
+        }
+
+        Ok(())
+    }
+
     /// Test unlink of a BASE file in a deeply nested promoted parent.
     ///
     /// Scenario: base has /a/b/file.txt, promote /a/b/ by creating a delta
@@ -2318,6 +2369,49 @@ mod tests {
             "readdir should show renamed.txt after rename, got: {:?}",
             entries
         );
+
+        Ok(())
+    }
+
+    /// Unlink of a base file must create a whiteout even when the parent
+    /// directory has a stale origin mapping from a previous session.
+    #[tokio::test]
+    async fn test_overlay_unlink_base_file_whiteout_after_remount() -> Result<()> {
+        let base_dir = tempdir()?;
+        std::fs::create_dir(base_dir.path().join("dir"))?;
+        std::fs::write(base_dir.path().join("dir/base.txt"), b"base content")?;
+
+        let delta_dir = tempdir()?;
+        let db_path = delta_dir.path().join("delta.db");
+
+        // Session 1: create delta file (creates origin mapping for /dir/)
+        {
+            let base = Arc::new(HostFS::new(base_dir.path())?);
+            let delta = AgentFS::new(db_path.to_str().unwrap()).await?;
+            let overlay = OverlayFS::new(base, delta);
+            overlay.init(base_dir.path().to_str().unwrap()).await?;
+
+            let dir_stats = overlay.lookup(ROOT_INO, "dir").await?.unwrap();
+            let (_s, f) = overlay
+                .create_file(dir_stats.ino, "delta.txt", DEFAULT_FILE_MODE, 0, 0)
+                .await?;
+            f.pwrite(0, b"delta").await?;
+        }
+
+        // Session 2: remount and unlink the base file
+        {
+            let base = Arc::new(HostFS::new(base_dir.path())?);
+            let delta = AgentFS::new(db_path.to_str().unwrap()).await?;
+            let overlay = OverlayFS::new(base, delta);
+            overlay.init(base_dir.path().to_str().unwrap()).await?;
+
+            let dir_stats = overlay.lookup(ROOT_INO, "dir").await?.unwrap();
+            overlay.unlink(dir_stats.ino, "base.txt").await?;
+            assert!(
+                overlay.lookup(dir_stats.ino, "base.txt").await?.is_none(),
+                "base.txt should be whiteout-deleted after unlink"
+            );
+        }
 
         Ok(())
     }
@@ -2547,6 +2641,98 @@ mod tests {
         let f = overlay.open(recreated.unwrap().ino, libc::O_RDONLY).await?;
         let data = f.pread(0, 1024).await?;
         assert_eq!(data, b"recreated");
+
+        Ok(())
+    }
+
+    /// After remount, unlink must clean up both the delta entry and create
+    /// a whiteout for the base entry — even when the parent is tagged Delta
+    /// rather than Base.
+    #[tokio::test]
+    async fn test_overlay_unlink_removes_delta_entry_after_remount() -> Result<()> {
+        let base_dir = tempdir()?;
+        std::fs::create_dir(base_dir.path().join("dir"))?;
+        std::fs::write(base_dir.path().join("dir/file.txt"), b"original base")?;
+
+        let delta_dir = tempdir()?;
+        let db_path = delta_dir.path().join("delta.db");
+
+        // Session 1: copy-up file.txt to delta via write
+        {
+            let base = Arc::new(HostFS::new(base_dir.path())?);
+            let delta = AgentFS::new(db_path.to_str().unwrap()).await?;
+            let overlay = OverlayFS::new(base, delta);
+            overlay.init(base_dir.path().to_str().unwrap()).await?;
+
+            let dir_stats = overlay.lookup(ROOT_INO, "dir").await?.unwrap();
+            let file_stats = overlay.lookup(dir_stats.ino, "file.txt").await?.unwrap();
+            let file = overlay.open(file_stats.ino, libc::O_WRONLY).await?;
+            file.pwrite(0, b"modified in delta").await?;
+        }
+
+        // Session 2: remount, unlink, recreate, verify new content
+        {
+            let base = Arc::new(HostFS::new(base_dir.path())?);
+            let delta = AgentFS::new(db_path.to_str().unwrap()).await?;
+            let overlay = OverlayFS::new(base, delta);
+            overlay.init(base_dir.path().to_str().unwrap()).await?;
+
+            let dir_stats = overlay.lookup(ROOT_INO, "dir").await?.unwrap();
+            overlay.unlink(dir_stats.ino, "file.txt").await?;
+            assert!(overlay.lookup(dir_stats.ino, "file.txt").await?.is_none());
+
+            let (_stats, new_file) = overlay
+                .create_file(dir_stats.ino, "file.txt", DEFAULT_FILE_MODE, 0, 0)
+                .await?;
+            new_file.pwrite(0, b"brand new content").await?;
+
+            let read_stats = overlay.lookup(dir_stats.ino, "file.txt").await?.unwrap();
+            let read_file = overlay.open(read_stats.ino, libc::O_RDONLY).await?;
+            let content = read_file.pread(0, 1024).await?;
+            assert_eq!(std::str::from_utf8(&content).unwrap(), "brand new content");
+        }
+
+        Ok(())
+    }
+
+    /// Hard-link copy-up in session 1, then unlink source in session 2.
+    /// The link target must survive even though the parent has a stale
+    /// origin mapping.
+    #[tokio::test]
+    async fn test_overlay_link_copy_up_then_unlink_after_remount() -> Result<()> {
+        let base_dir = tempdir()?;
+        std::fs::create_dir(base_dir.path().join("dir"))?;
+        std::fs::write(base_dir.path().join("dir/src.txt"), b"link source")?;
+
+        let delta_dir = tempdir()?;
+        let db_path = delta_dir.path().join("delta.db");
+
+        // Session 1: hard-link triggers copy_up of src.txt
+        {
+            let base = Arc::new(HostFS::new(base_dir.path())?);
+            let delta = AgentFS::new(db_path.to_str().unwrap()).await?;
+            let overlay = OverlayFS::new(base, delta);
+            overlay.init(base_dir.path().to_str().unwrap()).await?;
+
+            let dir_stats = overlay.lookup(ROOT_INO, "dir").await?.unwrap();
+            let src_stats = overlay.lookup(dir_stats.ino, "src.txt").await?.unwrap();
+            overlay
+                .link(src_stats.ino, dir_stats.ino, "dst.txt")
+                .await?;
+        }
+
+        // Session 2: remount, unlink source, verify link survives
+        {
+            let base = Arc::new(HostFS::new(base_dir.path())?);
+            let delta = AgentFS::new(db_path.to_str().unwrap()).await?;
+            let overlay = OverlayFS::new(base, delta);
+            overlay.init(base_dir.path().to_str().unwrap()).await?;
+
+            let dir_stats = overlay.lookup(ROOT_INO, "dir").await?.unwrap();
+            overlay.unlink(dir_stats.ino, "src.txt").await?;
+            assert!(overlay.lookup(dir_stats.ino, "src.txt").await?.is_none());
+            assert!(overlay.lookup(dir_stats.ino, "dst.txt").await?.is_some());
+        }
 
         Ok(())
     }

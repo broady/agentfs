@@ -26,6 +26,7 @@ cleanup
 mkdir -p "$BASEDIR/.git"
 echo "[core]" > "$BASEDIR/.git/config"
 echo "ref: refs/heads/main" > "$BASEDIR/.git/HEAD"
+echo "description" > "$BASEDIR/.git/description"
 
 # Initialize the database with --base for overlay
 if ! output=$(cargo run -- init "$TEST_AGENT_ID" --base "$BASEDIR" 2>&1); then
@@ -155,6 +156,57 @@ rmdir "$MOUNTPOINT/.git/objects"
 if [ -d "$MOUNTPOINT/.git/objects" ]; then
     echo "FAILED: objects directory still exists after rmdir"
     kill $MOUNT_PID 2>/dev/null || true
+    exit 1
+fi
+
+# --- Base file whiteout tests (promoted parent) ---
+# At this point .git/ has been promoted to Delta by the index.lock
+# creation above. Test unlink/rename of BASE files in this promoted dir.
+
+# Unlink a base file — whiteout must be created so it doesn't reappear
+rm "$MOUNTPOINT/.git/HEAD"
+
+if [ -f "$MOUNTPOINT/.git/HEAD" ]; then
+    echo "FAILED: base HEAD still visible after unlink (missing whiteout)"
+    exit 1
+fi
+
+LS_AFTER_RM=$(ls "$MOUNTPOINT/.git")
+if echo "$LS_AFTER_RM" | grep -q "^HEAD$"; then
+    echo "FAILED: readdir still shows HEAD after unlink"
+    echo "ls output was: $LS_AFTER_RM"
+    exit 1
+fi
+
+# Recreate at the same path (unlink + recreate pattern)
+echo "new HEAD" > "$MOUNTPOINT/.git/HEAD"
+if [ ! -f "$MOUNTPOINT/.git/HEAD" ]; then
+    echo "FAILED: could not recreate HEAD after unlink"
+    exit 1
+fi
+
+# Rename a base file in the promoted directory
+mv "$MOUNTPOINT/.git/description" "$MOUNTPOINT/.git/description.bak"
+
+if [ -f "$MOUNTPOINT/.git/description" ]; then
+    echo "FAILED: description still visible after rename (missing whiteout)"
+    exit 1
+fi
+
+if [ ! -f "$MOUNTPOINT/.git/description.bak" ]; then
+    echo "FAILED: description.bak not visible after rename"
+    exit 1
+fi
+
+# config (base file) should still be intact
+if [ ! -f "$MOUNTPOINT/.git/config" ]; then
+    echo "FAILED: base config disappeared"
+    exit 1
+fi
+
+# Base directory should be untouched
+if [ ! -f "$BASEDIR/.git/HEAD" ]; then
+    echo "FAILED: base HEAD was modified"
     exit 1
 fi
 

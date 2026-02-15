@@ -8,6 +8,7 @@ use std::{
 #[derive(Debug)]
 pub enum NotifyOp {
     InvalEntry { parent: u64, name: OsString },
+    InvalInode { ino: u64, offset: i64, len: i64 },
 }
 
 /// Queues kernel cache invalidation requests for deferred execution.
@@ -38,6 +39,65 @@ impl DeferredNotifier {
             name: name.to_os_string(),
         }) {
             debug!("deferred inval_entry send failed (notify thread gone?): {e}");
+        }
+    }
+
+    pub fn inval_inode(&self, ino: u64, offset: i64, len: i64) {
+        if let Err(e) = self.tx.send(NotifyOp::InvalInode { ino, offset, len }) {
+            debug!("deferred inval_inode send failed (notify thread gone?): {e}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DeferredNotifier, NotifyOp};
+    use std::ffi::OsStr;
+    use std::sync::mpsc;
+
+    #[test]
+    fn queues_inval_inode() {
+        let (tx, rx) = mpsc::channel();
+        let deferred = DeferredNotifier::new(tx);
+
+        deferred.inval_inode(42, 0, 0);
+
+        let op = rx.recv().expect("expected queued notify op");
+        match op {
+            NotifyOp::InvalInode { ino, offset, len } => {
+                assert_eq!(ino, 42);
+                assert_eq!(offset, 0);
+                assert_eq!(len, 0);
+            }
+            NotifyOp::InvalEntry { .. } => panic!("expected InvalInode op"),
+        }
+    }
+
+    #[test]
+    fn preserves_notification_order() {
+        let (tx, rx) = mpsc::channel();
+        let deferred = DeferredNotifier::new(tx);
+
+        deferred.inval_entry(7, OsStr::new("foo"));
+        deferred.inval_inode(7, 0, 0);
+
+        let first = rx.recv().expect("expected first notify op");
+        match first {
+            NotifyOp::InvalEntry { parent, name } => {
+                assert_eq!(parent, 7);
+                assert_eq!(name, OsStr::new("foo"));
+            }
+            NotifyOp::InvalInode { .. } => panic!("expected InvalEntry first"),
+        }
+
+        let second = rx.recv().expect("expected second notify op");
+        match second {
+            NotifyOp::InvalInode { ino, offset, len } => {
+                assert_eq!(ino, 7);
+                assert_eq!(offset, 0);
+                assert_eq!(len, 0);
+            }
+            NotifyOp::InvalEntry { .. } => panic!("expected InvalInode second"),
         }
     }
 }

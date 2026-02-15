@@ -620,7 +620,9 @@ impl Filesystem for AgentFSFuse {
         match result {
             Ok(()) => {
                 reply.ok();
-                req.deferred_notifier().inval_entry(parent, name);
+                let dn = req.deferred_notifier();
+                dn.inval_entry(parent, name);
+                dn.inval_inode(parent, 0, 0);
             }
             Err(e) => reply.error(error_to_errno(&e)),
         }
@@ -791,7 +793,9 @@ impl Filesystem for AgentFSFuse {
         match result {
             Ok(()) => {
                 reply.ok();
-                req.deferred_notifier().inval_entry(parent, name);
+                let dn = req.deferred_notifier();
+                dn.inval_entry(parent, name);
+                dn.inval_inode(parent, 0, 0);
             }
             Err(e) => reply.error(error_to_errno(&e)),
         }
@@ -846,7 +850,9 @@ impl Filesystem for AgentFSFuse {
                 reply.ok();
                 let dn = req.deferred_notifier();
                 dn.inval_entry(parent, name);
+                dn.inval_inode(parent, 0, 0);
                 dn.inval_entry(newparent, newname);
+                dn.inval_inode(newparent, 0, 0);
             }
             Err(e) => reply.error(error_to_errno(&e)),
         }

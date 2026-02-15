@@ -168,6 +168,9 @@ impl<FS: Filesystem> Session<FS> {
                     NotifyOp::InvalEntry { parent, ref name } => {
                         notifier.inval_entry(parent, name.as_os_str())
                     }
+                    NotifyOp::InvalInode { ino, offset, len } => {
+                        notifier.inval_inode(ino, offset, len)
+                    }
                 };
                 if let Err(e) = res {
                     debug!("FUSE notify failed: {e}");
